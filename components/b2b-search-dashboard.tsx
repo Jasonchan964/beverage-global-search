@@ -1,12 +1,26 @@
 "use client";
 
-import { useMemo, useState, type KeyboardEvent } from "react";
+import { useState } from "react";
+import {
+  APOLLO_KEYWORD_LABEL_CN,
+  APOLLO_KEYWORD_TAGS,
+  type ApolloKeywordTag,
+} from "@/lib/apollo-industry-keywords";
+import type { SearchApiSuccess, SearchResultItem } from "@/types/api-search";
 
-type ApiSearchResult = {
-  name: string;
-  domain: string | null;
-  industryTags: string[];
-};
+function safeStringify(payload: unknown): string {
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return String(payload);
+  }
+}
+
+function isSearchApiSuccess(data: unknown): data is SearchApiSuccess {
+  if (typeof data !== "object" || data === null) return false;
+  const d = data as Record<string, unknown>;
+  return Array.isArray(d.results);
+}
 
 const COUNTRIES = [
   { code: "", label: "全部国家 / All" },
@@ -22,19 +36,6 @@ function countryLabelForCode(code: string): string {
   if (!code) return "不限地区";
   const row = COUNTRIES.find((c) => c.code === code);
   return row?.label ?? code;
-}
-
-function matchesLocalQuery(company: ApiSearchResult, q: string): boolean {
-  if (!q.trim()) return true;
-  const needle = q.trim().toLowerCase();
-  const hay = [
-    company.name,
-    company.domain ?? "",
-    ...company.industryTags,
-  ]
-    .join(" ")
-    .toLowerCase();
-  return hay.includes(needle);
 }
 
 function websiteUrl(domain: string | null): string | null {
@@ -78,18 +79,35 @@ function ResultCardSkeleton() {
 
 export function B2bSearchDashboard() {
   const [country, setCountry] = useState<string>("");
-  const [query, setQuery] = useState("");
+  const [selectedTags, setSelectedTags] = useState<Set<ApolloKeywordTag>>(
+    () => new Set(APOLLO_KEYWORD_TAGS),
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [apiResults, setApiResults] = useState<ApiSearchResult[]>([]);
+  const [apiResults, setApiResults] = useState<SearchResultItem[]>([]);
   const [searchedCountryCode, setSearchedCountryCode] = useState<string>("");
   const [hasSearched, setHasSearched] = useState(false);
+  const [lastAppliedKeywords, setLastAppliedKeywords] = useState<string[]>([]);
 
-  const displayResults = useMemo(() => {
-    return apiResults.filter((c) => matchesLocalQuery(c, query));
-  }, [apiResults, query]);
+  const toggleTag = (tag: ApolloKeywordTag) => {
+    setSelectedTags((prev) => {
+      const next = new Set(prev);
+      if (next.has(tag)) next.delete(tag);
+      else next.add(tag);
+      return next;
+    });
+  };
 
   const runSearch = async () => {
+    const industryKeywords = APOLLO_KEYWORD_TAGS.filter((t) =>
+      selectedTags.has(t),
+    );
+
+    if (industryKeywords.length === 0) {
+      setError("请至少选择一个行业（饮料 / 乳制品 / 饮用水）。");
+      return;
+    }
+
     setLoading(true);
     setError(null);
     try {
@@ -98,12 +116,20 @@ export function B2bSearchDashboard() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           country: country.trim() === "" ? undefined : country.trim(),
+          industryKeywords,
         }),
       });
 
       const data: unknown = await res.json();
 
       if (!res.ok) {
+        const detailStr =
+          typeof data === "object" &&
+          data !== null &&
+          "details" in data &&
+          (data as { details?: unknown }).details !== undefined
+            ? safeStringify((data as { details: unknown }).details)
+            : "";
         const msg =
           typeof data === "object" &&
           data !== null &&
@@ -111,31 +137,30 @@ export function B2bSearchDashboard() {
           typeof (data as { error: unknown }).error === "string"
             ? (data as { error: string }).error
             : `请求失败（${res.status}）`;
-        throw new Error(msg);
+        throw new Error(detailStr ? `${msg}: ${detailStr}` : msg);
       }
 
-      if (
-        typeof data !== "object" ||
-        data === null ||
-        !("results" in data) ||
-        !Array.isArray((data as { results: unknown }).results)
-      ) {
+      if (!isSearchApiSuccess(data)) {
         throw new Error("返回数据格式异常。");
       }
 
-      const raw = (data as { results: unknown[] }).results;
-      const parsed: ApiSearchResult[] = raw.map((row) => {
-        const r = row as Record<string, unknown>;
-        const name = typeof r.name === "string" ? r.name : "";
-        const domain = typeof r.domain === "string" ? r.domain : null;
-        const tags = Array.isArray(r.industryTags)
-          ? r.industryTags.filter((t): t is string => typeof t === "string")
+      const parsed: SearchResultItem[] = data.results.map((row) => {
+        const name = typeof row.name === "string" ? row.name : "";
+        const domain =
+          row.domain === null
+            ? null
+            : typeof row.domain === "string"
+              ? row.domain
+              : null;
+        const tags = Array.isArray(row.industryTags)
+          ? row.industryTags.filter((t): t is string => typeof t === "string")
           : [];
         return { name, domain, industryTags: tags };
       });
 
       setApiResults(parsed);
       setSearchedCountryCode(country);
+      setLastAppliedKeywords(data.appliedIndustryKeywords);
       setHasSearched(true);
     } catch (e) {
       setApiResults([]);
@@ -149,11 +174,16 @@ export function B2bSearchDashboard() {
     void runSearch();
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") void runSearch();
-  };
-
   const countryShown = countryLabelForCode(searchedCountryCode);
+  const industrySummary =
+    lastAppliedKeywords.length > 0
+      ? lastAppliedKeywords
+          .map(
+            (k) =>
+              APOLLO_KEYWORD_LABEL_CN[k as ApolloKeywordTag] ?? k,
+          )
+          .join("、")
+      : null;
 
   return (
     <div className="mx-auto w-full max-w-6xl px-4 py-10 sm:px-6 lg:px-8">
@@ -165,58 +195,82 @@ export function B2bSearchDashboard() {
           企业搜索仪表盘
         </h1>
         <p className="mt-3 max-w-2xl text-slate-600">
-          选择国家并搜索，对接 Apollo 企业库（饮料 / 乳制品 / 水等关键词）；可使用关键词框在结果中筛选。
+          选择 Apollo 固定行业标签（对应 Beverage / Dairy /
+          Water）与国家（可选），一键拉取匹配企业。
         </p>
       </header>
 
-      <div className="rounded-2xl border border-slate-200/80 bg-white p-2 shadow-sm shadow-slate-200/50 ring-1 ring-slate-100 sm:p-3">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
-          <div className="relative sm:w-48 sm:flex-shrink-0">
-            <label htmlFor="country" className="sr-only">
-              国家
+      <div className="rounded-2xl border border-slate-200/80 bg-white p-3 shadow-sm shadow-slate-200/50 ring-1 ring-slate-100 sm:p-4">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:gap-5">
+          <div className="w-full lg:w-48 lg:flex-shrink-0">
+            <label
+              htmlFor="country"
+              className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-slate-500"
+            >
+              总部国家
             </label>
-            <select
-              id="country"
-              value={country}
-              onChange={(e) => setCountry(e.target.value)}
-              disabled={loading}
-              className="h-14 w-full cursor-pointer appearance-none rounded-xl border border-slate-200 bg-slate-50 pl-4 pr-10 text-sm font-medium text-slate-800 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-2 focus:ring-blue-500/20 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {COUNTRIES.map((c) => (
-                <option key={c.code || "all"} value={c.code}>
-                  {c.label}
-                </option>
-              ))}
-            </select>
-            <span
-              aria-hidden
-              className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
-            >
-              ▼
-            </span>
+            <div className="relative">
+              <select
+                id="country"
+                value={country}
+                onChange={(e) => setCountry(e.target.value)}
+                disabled={loading}
+                className="h-12 w-full cursor-pointer appearance-none rounded-xl border border-slate-200 bg-slate-50 pl-4 pr-10 text-sm font-medium text-slate-800 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-2 focus:ring-blue-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {COUNTRIES.map((c) => (
+                  <option key={c.code || "all"} value={c.code}>
+                    {c.label}
+                  </option>
+                ))}
+              </select>
+              <span
+                aria-hidden
+                className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
+              >
+                ▼
+              </span>
+            </div>
           </div>
 
-          <div className="relative min-w-0 flex-1">
-            <label htmlFor="query" className="sr-only">
-              搜索企业
-            </label>
-            <input
-              id="query"
-              type="search"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="在当前结果中筛选：企业名、域名或标签…"
-              disabled={loading}
-              className="h-14 w-full rounded-xl border border-slate-200 bg-white px-4 text-base text-slate-900 outline-none placeholder:text-slate-400 focus:border-blue-400 focus:ring-2 focus:ring-blue-500/20 disabled:cursor-not-allowed disabled:opacity-60 sm:text-[15px]"
-            />
-          </div>
+          <fieldset className="min-w-0 flex-1 border-0 p-0">
+            <legend className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              行业（Apollo 关键词）
+            </legend>
+            <div className="flex flex-wrap gap-2">
+              {APOLLO_KEYWORD_TAGS.map((tag) => {
+                const active = selectedTags.has(tag);
+                return (
+                  <button
+                    key={tag}
+                    type="button"
+                    aria-pressed={active}
+                    disabled={loading}
+                    onClick={() => toggleTag(tag)}
+                    className={`rounded-xl border px-4 py-2.5 text-sm font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-60 ${
+                      active
+                        ? "border-blue-600 bg-blue-600 text-white shadow-sm shadow-blue-600/20"
+                        : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50"
+                    }`}
+                  >
+                    {APOLLO_KEYWORD_LABEL_CN[tag]}
+                    <span
+                      className={
+                        active ? "ml-1.5 text-xs text-blue-100" : "ml-1.5 text-xs text-slate-400"
+                      }
+                    >
+                      {tag}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </fieldset>
 
           <button
             type="button"
             onClick={handleSearchClick}
             disabled={loading}
-            className="h-14 shrink-0 rounded-xl bg-blue-600 px-8 text-sm font-semibold text-white shadow-sm shadow-blue-600/25 transition hover:bg-blue-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 active:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-70 sm:px-10"
+            className="h-12 shrink-0 rounded-xl bg-blue-600 px-8 text-sm font-semibold text-white shadow-sm shadow-blue-600/25 transition hover:bg-blue-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 active:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-70 lg:self-end lg:px-10"
           >
             {loading ? "加载中…" : "搜索"}
           </button>
@@ -232,18 +286,18 @@ export function B2bSearchDashboard() {
                 <>
                   共{" "}
                   <span className="font-medium text-slate-700">
-                    {displayResults.length}
-                  </span>
-                  {displayResults.length !== apiResults.length && (
+                    {apiResults.length}
+                  </span>{" "}
+                  家企业
+                  {industrySummary ? (
                     <span className="text-slate-400">
                       {" "}
-                      / {apiResults.length} 条已加载
+                      · 行业：{industrySummary}
                     </span>
-                  )}
-                  {!query.trim() ? " 家企业" : " 条匹配筛选"}
+                  ) : null}
                 </>
               ) : (
-                <span>点击「搜索」从 Apollo 拉取数据</span>
+                <span>选择行业后点击「搜索」从 Apollo 拉取数据</span>
               )}
             </p>
           )}
@@ -267,20 +321,18 @@ export function B2bSearchDashboard() {
         ) : !hasSearched ? (
           <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/80 px-6 py-16 text-center">
             <p className="text-slate-600">
-              请选择国家（可选），点击「搜索」加载饮料 / 乳制品 / 水相关行业企业。
+              请选择至少一个行业与国家（可选），点击「搜索」从 Apollo 加载企业。
             </p>
           </div>
-        ) : displayResults.length === 0 ? (
+        ) : apiResults.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/80 px-6 py-16 text-center">
             <p className="text-slate-600">
-              {apiResults.length === 0
-                ? "未返回企业，请更换国家筛选或稍后重试。"
-                : "当前筛选条件下无匹配结果，请调整关键词。"}
+              未返回企业，请尝试其他行业组合或国家筛选。
             </p>
           </div>
         ) : (
           <ul className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
-            {displayResults.map((company, index) => {
+            {apiResults.map((company, index) => {
               const url = websiteUrl(company.domain);
               const mailto = mailtoForDomain(company.domain);
               const key = `${company.name}-${company.domain ?? "nodomain"}-${index}`;
