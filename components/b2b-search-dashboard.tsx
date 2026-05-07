@@ -56,7 +56,6 @@ function ResultCardSkeleton() {
         <div className="mt-3 flex flex-wrap gap-2">
           <div className="h-6 w-16 animate-pulse rounded-md bg-slate-200" />
           <div className="h-6 w-24 animate-pulse rounded-md bg-slate-200" />
-          <div className="h-6 w-20 animate-pulse rounded-md bg-slate-200" />
         </div>
         <div className="mt-4 space-y-3">
           <div className="flex gap-2">
@@ -104,7 +103,7 @@ export function B2bSearchDashboard() {
     );
 
     if (industryKeywords.length === 0) {
-      setError("请至少选择一个行业（饮料 / 乳制品 / 饮用水）。");
+      setError("请至少选择一个行业（饮料 / 乳制品）。");
       return;
     }
 
@@ -195,8 +194,8 @@ export function B2bSearchDashboard() {
           企业搜索仪表盘
         </h1>
         <p className="mt-3 max-w-2xl text-slate-600">
-          选择 Apollo 固定行业标签（对应 Beverage / Dairy /
-          Water）与国家（可选），一键拉取匹配企业。
+          使用 Apollo「组织搜索」接口：选择 Beverage / Dairy
+          关键词与总部国家（可选），拉取匹配企业。
         </p>
       </header>
 

@@ -6,9 +6,12 @@ import {
 } from "@/lib/apollo-industry-keywords";
 import type { SearchApiSuccess } from "@/types/api-search";
 
-/** Apollo documents “Organization Search” at this path (not `organizations/search`). */
+/**
+ * Organization search (available on plans where `mixed_companies/search` is not).
+ * @see https://api.apollo.io/v1/organizations/search
+ */
 const APOLLO_ORGANIZATION_SEARCH_URL =
-  "https://api.apollo.io/api/v1/mixed_companies/search";
+  "https://api.apollo.io/v1/organizations/search";
 
 const LOG_PREFIX = "[api/search]";
 
@@ -43,6 +46,54 @@ function resolveOrganizationLocation(countryParam: string | undefined): string[]
   const upper = countryParam.toUpperCase();
   const mapped = COUNTRY_CODE_TO_APOLLO_LOCATION[upper];
   return mapped ? [mapped] : [countryParam];
+}
+
+function pickOrgString(
+  org: Record<string, unknown>,
+  ...keys: string[]
+): string | undefined {
+  for (const k of keys) {
+    const v = org[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return undefined;
+}
+
+/** Normalize differing field names across Apollo org payloads. */
+function normalizeApolloOrgRecord(raw: unknown): ApolloOrganization {
+  if (!raw || typeof raw !== "object") return {};
+  const o = raw as Record<string, unknown>;
+
+  let keywords: string[] | undefined;
+  if (Array.isArray(o.keywords)) {
+    keywords = o.keywords.filter((x): x is string => typeof x === "string");
+  }
+
+  return {
+    name: pickOrgString(o, "name", "organization_name"),
+    primary_domain: pickOrgString(o, "primary_domain", "domain"),
+    website_url: pickOrgString(o, "website_url", "website", "homepage_url"),
+    industry: typeof o.industry === "string" ? o.industry.trim() || undefined : undefined,
+    keywords,
+  };
+}
+
+function extractOrganizationRows(data: Record<string, unknown>): unknown[] {
+  if (Array.isArray(data.organizations)) return data.organizations;
+  if (Array.isArray(data.accounts)) return data.accounts;
+
+  const nested = data.data;
+  if (Array.isArray(nested)) return nested;
+  if (nested !== null && typeof nested === "object") {
+    const d = nested as Record<string, unknown>;
+    if (Array.isArray(d.organizations)) return d.organizations;
+    if (Array.isArray(d.accounts)) return d.accounts;
+    if (Array.isArray(d.results)) return d.results;
+  }
+
+  if (Array.isArray(data.results)) return data.results;
+
+  return [];
 }
 
 function extractDomain(org: ApolloOrganization): string | null {
@@ -130,12 +181,14 @@ async function runSearch(countryRaw: unknown, industryKeywordsRaw: unknown) {
   try {
     const payload = buildApolloPayload(country, industryKeywords);
 
-    const { data, status } = await axios.post<{
-      organizations?: ApolloOrganization[];
-      pagination?: unknown;
-      error?: string;
-      message?: string;
-    }>(APOLLO_ORGANIZATION_SEARCH_URL, payload, {
+    const { data: rawData, status } = await axios.post<
+      Record<string, unknown> & {
+        organizations?: unknown[];
+        pagination?: unknown;
+        error?: string;
+        message?: string;
+      }
+    >(APOLLO_ORGANIZATION_SEARCH_URL, payload, {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
@@ -145,18 +198,10 @@ async function runSearch(countryRaw: unknown, industryKeywordsRaw: unknown) {
       timeout: 45_000,
     });
 
-    console.log(`${LOG_PREFIX} Apollo HTTP ${status}`, {
-      country: country ?? null,
-      industryKeywords,
-      orgCount: Array.isArray(data?.organizations)
-        ? data.organizations.length
-        : null,
-    });
-
-    if (typeof data !== "object" || data === null) {
+    if (typeof rawData !== "object" || rawData === null) {
       console.log(
         `${LOG_PREFIX} Apollo returned non-object body:`,
-        safeStringify(data),
+        safeStringify(rawData),
       );
       return NextResponse.json(
         { error: "Unexpected Apollo response shape." },
@@ -164,29 +209,45 @@ async function runSearch(countryRaw: unknown, industryKeywordsRaw: unknown) {
       );
     }
 
-    if (typeof data.error === "string" && data.error.trim()) {
-      console.log(`${LOG_PREFIX} Apollo error field:`, safeStringify(data));
+    console.log(`${LOG_PREFIX} Apollo HTTP ${status}`, {
+      country: country ?? null,
+      industryKeywords,
+      responseKeys:
+        typeof rawData === "object" && rawData !== null
+          ? Object.keys(rawData)
+          : [],
+    });
+
+    if (typeof rawData.error === "string" && rawData.error.trim()) {
+      console.log(`${LOG_PREFIX} Apollo error field:`, safeStringify(rawData));
       return NextResponse.json(
         {
           error: "Apollo returned an error.",
-          details: data,
+          details: rawData,
         },
         { status: 502 },
       );
     }
 
-    const orgs = data.organizations ?? [];
+    const pagination =
+      typeof rawData.pagination !== "undefined" ? rawData.pagination : null;
 
-    const results = orgs.map((org) => ({
-      name: org.name ?? "",
-      domain: extractDomain(org),
-      industryTags: buildIndustryTags(org),
-    }));
+    const rows = extractOrganizationRows(rawData);
+    console.log(`${LOG_PREFIX} Parsed organization rows count: ${rows.length}`);
+
+    const results = rows.map((row) => {
+      const org = normalizeApolloOrgRecord(row);
+      return {
+        name: org.name ?? "",
+        domain: extractDomain(org),
+        industryTags: buildIndustryTags(org),
+      };
+    });
 
     const body: SearchApiSuccess = {
       country: country ?? null,
       appliedIndustryKeywords: industryKeywords,
-      pagination: data.pagination ?? null,
+      pagination,
       results,
     };
 
@@ -231,8 +292,8 @@ async function runSearch(countryRaw: unknown, industryKeywordsRaw: unknown) {
 }
 
 /**
- * Body: `{ country?: string; industryKeywords: ("Beverage"|"Dairy"|"Water")[] }`.
- * Omit country or empty string = no HQ location filter.
+ * Body: `{ country?: string; industryKeywords: ("Beverage"|"Dairy")[] }`.
+ * Omit country or empty string = no `organization_locations` filter.
  */
 export async function POST(request: Request) {
   let body: unknown;
@@ -258,7 +319,7 @@ export async function POST(request: Request) {
   return runSearch(country, industryKeywords);
 }
 
-/** `GET /api/search?country=US&keywords=Beverage,Water` — keywords optional (default all three). */
+/** `GET /api/search?country=US&keywords=Beverage,Dairy` — keywords optional (default: both). */
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const country = searchParams.get("country") ?? undefined;
